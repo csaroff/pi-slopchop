@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
-import type { ReviewFile } from "../types.js";
-import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePaths, getStackedPaneLayout, parseMouseWheelInput, shouldStackPanes } from "../ui/review-app.js";
+import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
+import { buildDisplayRows, buildEditorLaunchCommand, buildDefaultAppLaunchCommand, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getNextVisibleFocus, getPaneLayout, getRelatedFileMarker, getRelatedFilePaths, getStackedPaneLayout, parseMouseWheelInput, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -18,6 +18,36 @@ function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
     ...flags,
   };
 }
+
+function makeState(draft?: Partial<ReviewState["draft"]>): ReviewState {
+  return {
+    activeScope: "git-diff",
+    activeFileId: "src/app.ts",
+    searchQuery: "",
+    focus: "diff",
+    wrapLines: false,
+    hideUnchanged: false,
+    selectedCommentIndex: 0,
+    selectedLineTargetByScopeFile: {},
+    draft: {
+      allComment: "",
+      allIntent: "fix",
+      comments: [],
+      ...draft,
+    },
+  };
+}
+
+const lineComment: DiffReviewComment = {
+  id: "line:git-diff:src/app.ts:added:2",
+  fileId: "src/app.ts",
+  scope: "git-diff",
+  side: "added",
+  intent: "fix",
+  startLine: 2,
+  endLine: 2,
+  body: "Check this.",
+};
 
 describe("buildDisplayRows", () => {
   it("keeps deleted and added rows independently commentable when line numbers overlap", () => {
@@ -54,6 +84,39 @@ describe("getHalfPageStep", () => {
     expect(getHalfPageStep(1)).toBe(1);
     expect(getHalfPageStep(9)).toBe(4);
     expect(getHalfPageStep(10)).toBe(5);
+  });
+});
+
+describe("focus helpers", () => {
+  it("cycles right through visible panes like Tab", () => {
+    expect(getNextVisibleFocus("navigator", false, false)).toBe("diff");
+    expect(getNextVisibleFocus("diff", false, false)).toBe("comments");
+    expect(getNextVisibleFocus("comments", false, false)).toBe("navigator");
+  });
+
+  it("cycles left through visible panes like Shift+Tab", () => {
+    expect(getNextVisibleFocus("navigator", false, true)).toBe("comments");
+    expect(getNextVisibleFocus("comments", false, true)).toBe("diff");
+  });
+
+  it("skips the comments pane when comments are hidden", () => {
+    expect(getNextVisibleFocus("navigator", true, false)).toBe("diff");
+    expect(getNextVisibleFocus("diff", true, false)).toBe("navigator");
+    expect(getNextVisibleFocus("navigator", true, true)).toBe("diff");
+  });
+});
+
+describe("cancel confirmation", () => {
+  it("cancels immediately when there are no draft comments", () => {
+    expect(getDraftCommentCount(makeState())).toBe(0);
+    expect(getCancelAction(makeState())).toBe("cancel");
+  });
+
+  it("asks for confirmation before discarding saved comments", () => {
+    const state = makeState({ allComment: "Overall note", comments: [lineComment] });
+
+    expect(getDraftCommentCount(state)).toBe(2);
+    expect(getCancelAction(state)).toBe("confirm-discard");
   });
 });
 
@@ -118,6 +181,16 @@ describe("parseMouseWheelInput", () => {
 
   it("ignores non-wheel mouse events", () => {
     expect(parseMouseWheelInput("\x1b[<0;10;5M")).toBeNull();
+  });
+});
+
+describe("buildDefaultAppLaunchCommand", () => {
+  it("opens the requested file in the macOS default app with a line hint", () => {
+    expect(buildDefaultAppLaunchCommand("darwin", "/tmp/a b's.ts", 12)).toBe("open '/tmp/a b'\\''s.ts' --args +12");
+  });
+
+  it("falls back to xdg-open on other unix platforms", () => {
+    expect(buildDefaultAppLaunchCommand("linux", "/tmp/a b's.ts", 12)).toBe("xdg-open '/tmp/a b'\\''s.ts'");
   });
 });
 
