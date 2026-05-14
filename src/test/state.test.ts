@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampSelectedLineTarget,
   createInitialReviewState,
+  extendSelectedLineTarget,
   getDefaultScope,
   getFileComment,
   getFilteredFiles,
@@ -97,6 +98,45 @@ describe("review state", () => {
     expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.body).toBe("Second");
     expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.intent).toBe("fix");
     expect(getLineComment(state, "src/a.ts", "git-diff", "deleted", 12)?.body).toBe("Removed note");
+  });
+
+  it("supports line comment ranges", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "Range note", "discuss", 14);
+
+    expect(state.draft.comments).toHaveLength(1);
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 13)?.body).toBe("Range note");
+    expect(state.draft.comments[0]).toMatchObject({ startLine: 12, endLine: 14, intent: "discuss" });
+  });
+
+  it("replaces overlapping line comment ranges", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "Range note", "fix", 14);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 13, "Middle note");
+
+    expect(state.draft.comments).toHaveLength(1);
+    expect(state.draft.comments[0]).toMatchObject({ startLine: 13, endLine: 13, body: "Middle note" });
+  });
+
+  it("extends selected line targets on the same side", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    const targets = [{ side: "added" as const, line: 10 }, { side: "deleted" as const, line: 10 }, { side: "added" as const, line: 11 }, { side: "added" as const, line: 12 }];
+    state = extendSelectedLineTarget(state, "src/a.ts", "git-diff", targets, 1);
+    state = extendSelectedLineTarget(state, "src/a.ts", "git-diff", targets, 1);
+
+    expect(state.selectedLineTargetByScopeFile["git-diff::src/a.ts"]).toEqual({ side: "added", line: 12, endLine: 10 });
+  });
+
+  it("does not extend line targets across hidden gaps", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    const targets = [{ side: "added" as const, line: 10 }, { side: "added" as const, line: 20 }];
+    state = extendSelectedLineTarget(state, "src/a.ts", "git-diff", targets, 1);
+
+    expect(state.selectedLineTargetByScopeFile["git-diff::src/a.ts"]).toEqual({ side: "added", line: 10 });
   });
 
   it("enforces one file comment per file+scope", () => {

@@ -8,9 +8,11 @@ import {
   createInitialReviewState,
   deleteComment,
   ensureActiveFile,
+  extendSelectedLineTarget,
   getCommentsForFileScope,
   getFileComment,
   getLineComment,
+  getLineTargetRange,
   getScopedFiles,
   getSelectedLineTarget,
   hasDraftContent,
@@ -52,7 +54,7 @@ interface LoadedEntryLoading {
 type LoadedEntry = LoadedEntryReady | LoadedEntryError | LoadedEntryLoading;
 
 type EditTarget =
-  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; line: number; initialBody: string; intent: CommentIntent }
+  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent }
   | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent }
   | { kind: "all"; initialBody: string; intent: CommentIntent };
 
@@ -121,6 +123,37 @@ function runShellCommand(command: string, cwd: string, stdio: "inherit" | "ignor
     child.once("error", reject);
     child.once("close", (code) => resolve(code));
   });
+}
+
+function getClipboardCommandCandidates(platform: NodeJS.Platform): Array<{ command: string; args: string[] }> {
+  if (platform === "darwin") return [{ command: "pbcopy", args: [] }];
+  if (platform === "win32") return [{ command: "clip", args: [] }];
+  return [
+    { command: "wl-copy", args: [] },
+    { command: "xclip", args: ["-selection", "clipboard"] },
+    { command: "xsel", args: ["--clipboard", "--input"] },
+  ];
+}
+
+function runClipboardCommand(command: string, args: string[], text: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { env: process.env, stdio: ["pipe", "ignore", "ignore"] });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") resolve(false);
+      else reject(error);
+    });
+    child.once("close", (code) => resolve(code === 0));
+    child.stdin.on("error", () => undefined);
+    child.stdin.end(text);
+  });
+}
+
+async function copyTextToClipboard(text: string, platform: NodeJS.Platform = process.platform): Promise<boolean> {
+  for (const candidate of getClipboardCommandCandidates(platform)) {
+    const copied = await runClipboardCommand(candidate.command, candidate.args, text);
+    if (copied) return true;
+  }
+  return false;
 }
 
 export function getNextVisibleFocus(current: ReviewState["focus"], commentsHidden: boolean, backward = false): ReviewState["focus"] {
@@ -336,10 +369,27 @@ function formatLineSideLabel(side: ReviewLineTarget["side"]): string {
   return side === "deleted" ? "Deleted" : "Added";
 }
 
+function formatLineRange(startLine: number | null, endLine: number | null | undefined): string {
+  if (startLine == null) return "—";
+  if (endLine == null || endLine === startLine) return String(startLine);
+  return `${startLine}-${endLine}`;
+}
+
+function formatTargetRange(target: ReviewLineTarget): string {
+  const range = getLineTargetRange(target);
+  return formatLineRange(range.startLine, range.endLine);
+}
+
+function isTargetInRange(target: ReviewLineTarget | null, side: ReviewLineTarget["side"] | null, line: number | null): boolean {
+  if (target == null || side == null || line == null || target.side !== side) return false;
+  const range = getLineTargetRange(target);
+  return range.startLine <= line && line <= range.endLine;
+}
+
 function getPanelItemLabel(theme: Theme, item: CommentPanelItem): string {
   if (item.kind === "all") return `${getIntentBadge(theme, item.intent)} All note`;
   if (item.comment.side === "file") return `${getIntentBadge(theme, item.comment.intent)} File comment`;
-  return `${getIntentBadge(theme, item.comment.intent)} ${formatLineSideLabel(item.comment.side)} line ${item.comment.startLine}`;
+  return `${getIntentBadge(theme, item.comment.intent)} ${formatLineSideLabel(item.comment.side)} line ${formatLineRange(item.comment.startLine, item.comment.endLine)}`;
 }
 
 function centerText(text: string, width: number): string {
@@ -523,6 +573,7 @@ class ReviewApp {
   private helpMode = false;
   private commentsHidden = false;
   private discardConfirmOpen = false;
+  private diffGoPending = false;
   private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
   private editor: Editor;
@@ -757,6 +808,7 @@ class ReviewApp {
   private setScope(scope: ReviewScope): void {
     this.relatedFilterAnchorFileId = null;
     this.relatedFilterReturnFileId = null;
+    this.diffGoPending = false;
     this.state = setScope(this.state, this.options.files, scope);
     this.diffScroll = 0;
     this.navigatorScroll = 0;
@@ -812,7 +864,7 @@ class ReviewApp {
     } else if (target.kind === "file") {
       this.state = upsertFileComment(this.state, target.fileId, target.scope, value, target.intent);
     } else {
-      this.state = upsertLineComment(this.state, target.fileId, target.scope, target.side, target.line, value, target.intent);
+      this.state = upsertLineComment(this.state, target.fileId, target.scope, target.side, target.startLine, value, target.intent, target.endLine);
     }
 
     this.editTarget = null;
@@ -835,13 +887,15 @@ class ReviewApp {
       this.requestRender();
       return;
     }
+    const range = getLineTargetRange(target);
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
     this.openEditor({
       kind: "line",
       fileId: file.id,
       scope: this.state.activeScope,
       side: target.side,
-      line: target.line,
+      startLine: range.startLine,
+      endLine: range.endLine,
       initialBody: existing?.body ?? "",
       intent: defaultIntent,
     });
@@ -857,18 +911,20 @@ class ReviewApp {
       return;
     }
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
+    const range = existing == null ? getLineTargetRange(target) : { startLine: existing.startLine ?? target.line, endLine: existing.endLine ?? existing.startLine ?? target.line };
     this.openEditor({
       kind: "line",
       fileId: file.id,
       scope: this.state.activeScope,
       side: target.side,
-      line: target.line,
+      startLine: range.startLine,
+      endLine: range.endLine,
       initialBody: existing?.body ?? "",
       intent: existing?.intent ?? "fix",
     });
   }
 
-  private editFileComment(): void {
+  private editFileComment(defaultIntent?: CommentIntent): void {
     const file = this.activeFile();
     if (file == null) return;
     const existing = getFileComment(this.state, file.id, this.state.activeScope);
@@ -877,7 +933,7 @@ class ReviewApp {
       fileId: file.id,
       scope: this.state.activeScope,
       initialBody: existing?.body ?? "",
-      intent: existing?.intent ?? "fix",
+      intent: defaultIntent ?? existing?.intent ?? "fix",
     });
   }
 
@@ -939,11 +995,12 @@ class ReviewApp {
     this.state = setSelectedLineTarget(this.state, item.comment.fileId, item.comment.scope, {
       side: item.comment.side,
       line: item.comment.startLine ?? 1,
+      endLine: item.comment.endLine ?? item.comment.startLine ?? 1,
     });
     this.editLineComment();
   }
 
-  private getSelectedLineOpenLocation(openerLabel: string): { file: ReviewFile; filePath: string; editorLine: number } | null {
+  private getSelectedLineOpenLocation(openerLabel: string, fallbackToFileStart = false): { file: ReviewFile; filePath: string; editorLine: number } | null {
     const file = this.activeFile();
     if (file == null) {
       this.setMessage("No file selected.");
@@ -959,13 +1016,17 @@ class ReviewApp {
 
     const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
     if (target == null) {
-      this.setMessage(`No selectable diff line to open in ${openerLabel}.`);
-      this.requestRender();
-      return null;
+      if (!fallbackToFileStart) {
+        this.setMessage(`No selectable diff line to open in ${openerLabel}.`);
+        this.requestRender();
+        return null;
+      }
+      return { file, filePath: join(this.options.repoRoot, file.path), editorLine: 1 };
     }
 
     const diff = this.getDisplayDiff(file.id, this.state.activeScope);
     if (diff == null) {
+      if (fallbackToFileStart) return { file, filePath: join(this.options.repoRoot, file.path), editorLine: 1 };
       this.setMessage("Diff is still loading; try again in a moment.");
       this.requestRender();
       return null;
@@ -978,10 +1039,63 @@ class ReviewApp {
     };
   }
 
-  private async openSelectedLineInDefaultApp(): Promise<void> {
+  private getSelectedDiffText(file: ReviewFile): string | null {
+    const selectedTarget = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
+    const diff = this.getDisplayDiff(file.id, this.state.activeScope);
+    if (selectedTarget == null || diff == null) return null;
+    const selectedLines = buildDisplayRows(diff)
+      .filter((row) => isTargetInRange(selectedTarget, row.commentSide, row.commentLineNumber))
+      .map((row) => row.codeText);
+    return selectedLines.length === 0 ? null : selectedLines.join("\n");
+  }
+
+  private getSelectedCommentText(): string | null {
+    const file = this.activeFile();
+    const items = getCommentPanelItems(this.state, file?.id ?? null, this.state.activeScope);
+    const item = items[this.state.selectedCommentIndex];
+    if (item == null) return null;
+    return item.kind === "all" ? item.body : item.comment.body;
+  }
+
+  private async copyText(text: string | null, description: string): Promise<void> {
+    const trimmed = text?.trimEnd();
+    if (trimmed == null || trimmed.length === 0) {
+      this.setMessage(`Nothing to copy from ${description}.`);
+      this.requestRender();
+      return;
+    }
+    try {
+      const copied = await copyTextToClipboard(trimmed);
+      this.setMessage(copied ? `Copied ${description}.` : "No clipboard command found (tried pbcopy, wl-copy, xclip, xsel, clip).");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.setMessage(`Could not copy ${description}: ${message}`);
+    }
+    this.requestRender();
+  }
+
+  private async copyNavigatorSelection(): Promise<void> {
+    const file = this.activeFile();
+    await this.copyText(file?.path ?? null, "file path");
+  }
+
+  private async copyDiffSelection(): Promise<void> {
+    const file = this.activeFile();
+    if (file == null) {
+      await this.copyText(null, "diff selection");
+      return;
+    }
+    await this.copyText(this.getSelectedDiffText(file), "diff selection");
+  }
+
+  private async copyCommentSelection(): Promise<void> {
+    await this.copyText(this.getSelectedCommentText(), "comment");
+  }
+
+  private async openSelectedLineInDefaultApp(fallbackToFileStart = false): Promise<void> {
     if (this.externalEditorOpen) return;
 
-    const location = this.getSelectedLineOpenLocation("the default app");
+    const location = this.getSelectedLineOpenLocation("the default app", fallbackToFileStart);
     if (location == null) return;
 
     const command = buildDefaultAppLaunchCommand(process.platform, location.filePath, location.editorLine);
@@ -1001,10 +1115,10 @@ class ReviewApp {
     }
   }
 
-  private async openSelectedLineInEditor(): Promise<void> {
+  private async openSelectedLineInEditor(fallbackToFileStart = false): Promise<void> {
     if (this.externalEditorOpen) return;
 
-    const location = this.getSelectedLineOpenLocation("$EDITOR");
+    const location = this.getSelectedLineOpenLocation("$EDITOR", fallbackToFileStart);
     if (location == null) return;
 
     const editorCommand = (process.env.EDITOR || process.env.VISUAL || "vi").trim() || "vi";
@@ -1152,6 +1266,7 @@ class ReviewApp {
   }
 
   private cycleVisibleFocus(backward = false): void {
+    this.diffGoPending = false;
     const nextFocus = getNextVisibleFocus(this.state.focus, this.commentsHidden, backward);
     this.state = setFocus(this.state, nextFocus);
     this.requestRender();
@@ -1217,6 +1332,29 @@ class ReviewApp {
     this.requestRender();
   }
 
+  private extendDiffSelection(delta: number): void {
+    const file = this.activeFile();
+    if (file == null) return;
+    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    this.state = extendSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, delta);
+    this.requestRender();
+  }
+
+  private jumpDiffSelection(position: "top" | "bottom"): void {
+    const file = this.activeFile();
+    if (file == null) return;
+    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    if (visibleTargets.length === 0) return;
+    this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, position === "top" ? visibleTargets[0]! : visibleTargets[visibleTargets.length - 1]!);
+    this.setMessage(position === "top" ? "Jumped to top of diff." : "Jumped to bottom of diff.");
+    this.requestRender();
+  }
+
+  private pageDiffSelection(delta: number): void {
+    const pageSize = Math.max(1, this.diffPageSize || 1);
+    this.moveDiffSelection(delta > 0 ? pageSize : -pageSize);
+  }
+
   private moveCommentSelection(delta: number): void {
     const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope);
     this.state = moveSelectedCommentIndex(this.state, items.length, delta);
@@ -1267,7 +1405,8 @@ class ReviewApp {
       return;
     }
 
-    this.state = upsertLineComment(this.state, file.id, this.state.activeScope, target.side, target.line, shortcut.text, shortcut.intent);
+    const range = getLineTargetRange(target);
+    this.state = upsertLineComment(this.state, file.id, this.state.activeScope, target.side, range.startLine, shortcut.text, shortcut.intent, range.endLine);
     this.shortcutMode = false;
     this.requestRender();
   }
@@ -1347,6 +1486,8 @@ class ReviewApp {
     if (data === "?") { this.toggleHelpMode(); return; }
     if (this.helpMode && matchesKey(data, Key.escape)) { this.helpMode = false; this.requestRender(); return; }
 
+    if (!(this.state.focus === "diff" && data === "g")) this.diffGoPending = false;
+
     if (data === "1") { this.setScope("git-diff"); return; }
     if (data === "2") { this.setScope("last-commit"); return; }
     if (data === "3") { this.setScope("all-files"); return; }
@@ -1363,6 +1504,26 @@ class ReviewApp {
     if (data === "p") { this.moveHunk(-1); return; }
 
     if (this.state.focus === "navigator") {
+      if (data === "y") {
+        void this.copyNavigatorSelection();
+        return;
+      }
+      if (data === "o") {
+        void this.openSelectedLineInDefaultApp(true);
+        return;
+      }
+      if (data === "e") {
+        void this.openSelectedLineInEditor(true);
+        return;
+      }
+      if (data === "f") {
+        this.editFileComment("fix");
+        return;
+      }
+      if (data === "d" || data === "c") {
+        this.editFileComment("discuss");
+        return;
+      }
       if (matchesKey(data, Key.down) || data === "j") {
         this.moveNavigatorSelection(1);
         return;
@@ -1397,6 +1558,38 @@ class ReviewApp {
       }
       const file = this.activeFile();
       if (file != null) {
+        if (data === "g") {
+          if (this.diffGoPending) {
+            this.diffGoPending = false;
+            this.jumpDiffSelection("top");
+            return;
+          }
+          this.diffGoPending = true;
+          this.setMessage("Press g again to jump to the top of the diff.");
+          this.requestRender();
+          return;
+        }
+        if (data === "G" || matchesKey(data, Key.shift("g"))) {
+          this.diffGoPending = false;
+          this.jumpDiffSelection("bottom");
+          return;
+        }
+        if (matchesKey(data, Key.shift("down"))) {
+          this.extendDiffSelection(1);
+          return;
+        }
+        if (matchesKey(data, Key.shift("up"))) {
+          this.extendDiffSelection(-1);
+          return;
+        }
+        if (matchesKey(data, Key.pageDown)) {
+          this.pageDiffSelection(1);
+          return;
+        }
+        if (matchesKey(data, Key.pageUp)) {
+          this.pageDiffSelection(-1);
+          return;
+        }
         if (matchesKey(data, Key.down) || data === "j") {
           this.moveDiffSelection(1);
           return;
@@ -1411,6 +1604,10 @@ class ReviewApp {
         }
         if (matchesKey(data, Key.ctrl("u"))) {
           this.moveDiffSelection(-getHalfPageStep(this.diffPageSize));
+          return;
+        }
+        if (data === "y") {
+          void this.copyDiffSelection();
           return;
         }
         if (data === "o") {
@@ -1455,6 +1652,10 @@ class ReviewApp {
       }
       if (matchesKey(data, Key.ctrl("u"))) {
         this.moveCommentSelection(-getHalfPageStep(this.commentsPageSize));
+        return;
+      }
+      if (data === "y") {
+        void this.copyCommentSelection();
         return;
       }
       if (data === "e" || matchesKey(data, Key.enter)) {
@@ -1549,10 +1750,11 @@ class ReviewApp {
     let selectedIndex = 0;
 
     for (const row of displayRows) {
-      const isSelected = row.commentLineNumber != null
+      const isActiveLine = row.commentLineNumber != null
         && row.commentSide != null
         && selectedTarget?.line === row.commentLineNumber
         && selectedTarget.side === row.commentSide;
+      const isSelected = isTargetInRange(selectedTarget, row.commentSide, row.commentLineNumber);
       const lineComment = row.commentLineNumber != null && row.commentSide != null
         ? getLineComment(this.state, file.id, this.state.activeScope, row.commentSide, row.commentLineNumber)
         : undefined;
@@ -1580,7 +1782,7 @@ class ReviewApp {
       }
 
       const renderedLines = this.getCachedRenderedDiffLines(width, this.state.wrapLines, row.kind, tone, contentText, isSelected);
-      if (isSelected) selectedIndex = rendered.length;
+      if (isActiveLine) selectedIndex = rendered.length;
       rendered.push(...renderedLines);
     }
 
@@ -1600,9 +1802,10 @@ class ReviewApp {
     lines.push(this.theme.fg("muted", "? toggle help • Esc close"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Keys"));
-    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab/←/→ focus • / shortcuts/search • r related • h comments • s submit"));
-    lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • x delete line"));
-    lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o default app • e $EDITOR • l file • a all • n/p hunks"));
+    lines.push(this.theme.fg("muted", "global: 1/2/3 scope • Tab/←/→ focus • / shortcuts/search • h comments • s submit"));
+    lines.push(this.theme.fg("muted", "navigator: r related • f file fix • d/c file discuss • y copy path • o default app • e $EDITOR"));
+    lines.push(this.theme.fg("muted", "diff: f line fix • d/c line discuss • Shift+↑↓ select range • Fn+↑↓ page • gg top • G bottom"));
+    lines.push(this.theme.fg("muted", "diff: / shortcuts • y copy selection • x delete line • o default app • e $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Editor"));
     lines.push(this.theme.fg("muted", "Tab toggle • Enter save • Shift+Enter newline • Esc cancel"));
@@ -1697,7 +1900,7 @@ class ReviewApp {
         ? "All note"
         : this.editTarget.kind === "file"
           ? "File comment"
-          : `${formatLineSideLabel(this.editTarget.side)} line ${this.editTarget.line}`));
+          : `${formatLineSideLabel(this.editTarget.side)} line ${formatLineRange(this.editTarget.startLine, this.editTarget.endLine)}`));
       lines.push(`${getIntentBadge(this.theme, this.editTarget.intent)} ${this.theme.fg("dim", "Tab toggle")}`);
       lines.push(this.theme.fg("dim", "Enter save • Shift+Enter newline"));
       lines.push(this.theme.fg("dim", "Esc cancel"));
@@ -1720,7 +1923,7 @@ class ReviewApp {
       lines.push(this.theme.fg("muted", `file: ${fileComment ? "commented" : "none"}`));
       lines.push(this.theme.fg("muted", selectedTarget == null
         ? "line —: none"
-        : `${formatLineSideLabel(selectedTarget.side).toLowerCase()} ${selectedTarget.line}: ${lineComment ? "commented" : "none"}`));
+        : `${formatLineSideLabel(selectedTarget.side).toLowerCase()} ${formatTargetRange(selectedTarget)}: ${lineComment ? "commented" : "none"}`));
       lines.push("");
     }
 
@@ -1747,7 +1950,7 @@ class ReviewApp {
         lines.push(`   ${line}`);
       }
       if (item.kind === "comment" && item.comment.side !== "file") {
-        lines.push(this.theme.fg("dim", `   ${getScopeDisplayPath(file, this.state.activeScope)}:${item.comment.startLine} (${item.comment.side})`));
+        lines.push(this.theme.fg("dim", `   ${getScopeDisplayPath(file, this.state.activeScope)}:${formatLineRange(item.comment.startLine, item.comment.endLine)} (${item.comment.side})`));
       }
       lines.push("");
     }
@@ -1763,7 +1966,6 @@ class ReviewApp {
     const frameInnerWidth = Math.max(20, this.lastWidth - 2 - MODAL_INNER_PADDING_X * 2);
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
     const stackPanes = shouldStackPanes(frameInnerWidth);
-    const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? 9 : 6, frameInnerHeight - 5);
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
     const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
@@ -1794,6 +1996,15 @@ class ReviewApp {
     const headerLines = [
       truncateToWidth(scopeTabs, frameInnerWidth, "", false),
     ];
+
+    const footer = [
+      truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓/j/k files • Ctrl+d/u half-page • r related • f fix file • d/c discuss file • l file note • y copy path • o default app • e $EDITOR • Enter diff"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "diff: ↑↓/j/k lines • Shift+↑↓ select range • Fn+↑↓ page • gg top • G bottom • / shortcuts • f fix • d/c discuss • y copy • x delete • n/p hunks"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "comments: h hide/show • ↑↓/j/k comments • Ctrl+d/u half-page • y copy • e/Enter edit • d delete"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "editor: Tab toggle intent • Enter save • Shift+Enter newline • Esc cancel • global: Tab/Shift+Tab/←/→ focus • 1/2/3 scopes • ? help • w wrap • u unchanged • s submit"), frameInnerWidth, "…", false),
+    ];
+    const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? 9 : 6, frameInnerHeight - headerLines.length - footer.length - 2);
 
     const body: string[] = [];
 
@@ -1840,11 +2051,6 @@ class ReviewApp {
           : `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
       }
     }
-
-    const footer = [
-      truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • focus: Tab/Shift+Tab/←/→ • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o default app, e $EDITOR, f fix line, d/c discuss line, x delete, l file, a all, n/p hunks • comments: h hide/show, ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
-    ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);
   }

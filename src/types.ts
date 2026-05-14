@@ -59,7 +59,10 @@ export type ReviewFocus = "navigator" | "diff" | "comments";
 
 export interface ReviewLineTarget {
   side: Exclude<CommentSide, "file">;
+  /** Active cursor line for the selection. */
   line: number;
+  /** Anchor line when selecting a range with Shift+Up/Down. */
+  endLine?: number;
 }
 
 export interface ReviewState {

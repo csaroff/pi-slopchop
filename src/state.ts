@@ -148,6 +148,32 @@ function sameLineTarget(a: ReviewLineTarget | null, b: ReviewLineTarget | null):
   return a?.side === b?.side && a?.line === b?.line;
 }
 
+function getTargetIndex(visibleTargets: ReviewLineTarget[], target: ReviewLineTarget): number {
+  const index = visibleTargets.findIndex((candidate) => sameLineTarget(candidate, target));
+  return index >= 0 ? index : 0;
+}
+
+function normalizeRange(startLine: number, endLine: number): { startLine: number; endLine: number } {
+  return {
+    startLine: Math.min(startLine, endLine),
+    endLine: Math.max(startLine, endLine),
+  };
+}
+
+function commentContainsLine(comment: DiffReviewComment, line: number): boolean {
+  if (comment.startLine == null) return false;
+  const { startLine, endLine } = normalizeRange(comment.startLine, comment.endLine ?? comment.startLine);
+  return startLine <= line && line <= endLine;
+}
+
+function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+export function getLineTargetRange(target: ReviewLineTarget): { startLine: number; endLine: number } {
+  return normalizeRange(target.line, target.endLine ?? target.line);
+}
+
 export function setSelectedLineTarget(state: ReviewState, fileId: string, scope: ReviewScope, target: ReviewLineTarget): ReviewState {
   return {
     ...state,
@@ -176,13 +202,40 @@ export function clampSelectedLineTarget(state: ReviewState, fileId: string, scop
 export function moveSelectedLineTarget(state: ReviewState, fileId: string, scope: ReviewScope, visibleTargets: ReviewLineTarget[], delta: number): ReviewState {
   if (visibleTargets.length === 0) return state;
   const current = getSelectedLineTarget(state, fileId, scope) ?? visibleTargets[0]!;
-  const index = Math.max(0, visibleTargets.findIndex((target) => sameLineTarget(target, current)));
+  const index = getTargetIndex(visibleTargets, current);
   const nextIndex = Math.max(0, Math.min(visibleTargets.length - 1, index + delta));
   return setSelectedLineTarget(state, fileId, scope, visibleTargets[nextIndex]!);
 }
 
-export function getCommentKey(comment: Pick<DiffReviewComment, "fileId" | "scope" | "side" | "startLine">): string {
-  return `${comment.scope}::${comment.fileId}::${comment.side}::${comment.startLine ?? "file"}`;
+export function extendSelectedLineTarget(state: ReviewState, fileId: string, scope: ReviewScope, visibleTargets: ReviewLineTarget[], delta: number): ReviewState {
+  if (visibleTargets.length === 0 || delta === 0) return state;
+  const current = getSelectedLineTarget(state, fileId, scope) ?? visibleTargets[0]!;
+  const currentIndex = getTargetIndex(visibleTargets, current);
+  const direction = delta > 0 ? 1 : -1;
+  const steps = Math.abs(delta);
+  let nextIndex = currentIndex;
+
+  for (let step = 0; step < steps; step += 1) {
+    const previous = visibleTargets[nextIndex]!;
+    let candidateIndex = nextIndex + direction;
+    while (candidateIndex >= 0 && candidateIndex < visibleTargets.length && visibleTargets[candidateIndex]!.side !== current.side) {
+      candidateIndex += direction;
+    }
+    if (candidateIndex < 0 || candidateIndex >= visibleTargets.length) break;
+
+    const candidate = visibleTargets[candidateIndex]!;
+    if (Math.abs(candidate.line - previous.line) !== 1) break;
+    nextIndex = candidateIndex;
+  }
+
+  const next = visibleTargets[nextIndex]!;
+  const anchor = current.endLine ?? current.line;
+  return setSelectedLineTarget(state, fileId, scope, next.line === anchor ? next : { ...next, endLine: anchor });
+}
+
+export function getCommentKey(comment: Pick<DiffReviewComment, "fileId" | "scope" | "side" | "startLine" | "endLine">): string {
+  const endLine = comment.endLine != null && comment.endLine !== comment.startLine ? `-${comment.endLine}` : "";
+  return `${comment.scope}::${comment.fileId}::${comment.side}::${comment.startLine ?? "file"}${endLine}`;
 }
 
 function withTrimmedBody(body: string): string {
@@ -194,7 +247,7 @@ export function getLineComment(state: ReviewState, fileId: string, scope: Review
     comment.fileId === fileId
       && comment.scope === scope
       && comment.side === side
-      && comment.startLine === line
+      && commentContainsLine(comment, line)
   ));
 }
 
@@ -234,25 +287,51 @@ function replaceComment(state: ReviewState, matcher: (comment: DiffReviewComment
   };
 }
 
-export function upsertLineComment(state: ReviewState, fileId: string, scope: ReviewScope, side: Exclude<CommentSide, "file">, line: number, body: string, intent: CommentIntent = "fix"): ReviewState {
+export function upsertLineComment(
+  state: ReviewState,
+  fileId: string,
+  scope: ReviewScope,
+  side: Exclude<CommentSide, "file">,
+  line: number,
+  body: string,
+  intent: CommentIntent = "fix",
+  endLine = line,
+): ReviewState {
   const trimmed = withTrimmedBody(body);
-  const existing = getLineComment(state, fileId, scope, side, line);
+  const range = normalizeRange(line, endLine);
+  const existing = state.draft.comments.find((comment) => (
+    comment.fileId === fileId
+      && comment.scope === scope
+      && comment.side === side
+      && comment.startLine != null
+      && rangesOverlap(
+        range.startLine,
+        range.endLine,
+        Math.min(comment.startLine, comment.endLine ?? comment.startLine),
+        Math.max(comment.startLine, comment.endLine ?? comment.startLine),
+      )
+  ));
+  const idRange = range.endLine === range.startLine ? `${range.startLine}` : `${range.startLine}-${range.endLine}`;
   const nextComment = trimmed.length === 0
     ? null
     : {
-        id: existing?.id ?? `line:${scope}:${fileId}:${side}:${line}`,
+        id: existing?.id ?? `line:${scope}:${fileId}:${side}:${idRange}`,
         fileId,
         scope,
         side,
         intent,
-        startLine: line,
-        endLine: line,
+        startLine: range.startLine,
+        endLine: range.endLine,
         body: trimmed,
       };
 
   return replaceComment(
     state,
-    (comment) => comment.fileId === fileId && comment.scope === scope && comment.side === side && comment.startLine === line,
+    (comment) => {
+      if (comment.fileId !== fileId || comment.scope !== scope || comment.side !== side || comment.startLine == null) return false;
+      const commentRange = normalizeRange(comment.startLine, comment.endLine ?? comment.startLine);
+      return rangesOverlap(range.startLine, range.endLine, commentRange.startLine, commentRange.endLine);
+    },
     nextComment,
   );
 }

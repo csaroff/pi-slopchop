@@ -177,18 +177,27 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 - `↑↓` or `j/k` — move between files
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `r` — toggle related-files filter in `all files` scope
+- `f` — file comment, default `FIX`
+- `d` or `c` — file comment, default `DISCUSS`
+- `o` — open the current file in the system default application
+- `e` — open the current file in `$EDITOR`, then return to `/slopchop` when the editor exits
+- `y` — copy the current file path
 - file rows show change counts as `+added -deleted`
 - `Enter` — move focus to diff
 
 #### Diff
 
 - `↑↓` or `j/k` — move between selectable added/deleted lines
+- `Shift+↑↓` — extend a multiline selection on the current added/deleted side
+- `Fn+↑↓` / `PageUp` / `PageDown` — move up / down by a page
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `gg` / `G` — jump to top / bottom
 - `n / p` — next / previous hunk
 - `o` — open the selected line in the system default application
 - `f` — line comment, default `FIX`
 - `d` or `c` — line comment, default `DISCUSS`
 - `e` — open the selected line in `$EDITOR`, then return to `/slopchop` when the editor exits
+- `y` — copy the selected line or multiline selection
 - `x` — delete the existing line comment on the selected line
 - `l` — file comment
 - `a` — whole-change note
@@ -203,6 +212,7 @@ Line comment markers in the diff gutter:
 
 - `↑↓` or `j/k` — move through saved comments
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `y` — copy selected comment text
 - `e` or `Enter` — edit selected comment
 - `d` — delete selected comment
 
