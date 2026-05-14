@@ -7,11 +7,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/robzolkos/pi-slopchop.git"
+    "url": "git+https://github.com/csaroff/pi-slopchop.git"
   },
-  "homepage": "https://github.com/robzolkos/pi-slopchop#readme",
+  "homepage": "https://github.com/csaroff/pi-slopchop#readme",
   "bugs": {
-    "url": "https://github.com/robzolkos/pi-slopchop/issues"
+    "url": "https://github.com/csaroff/pi-slopchop/issues"
   },
   "files": [
     "src/diff.ts",

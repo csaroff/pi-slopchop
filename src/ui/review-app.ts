@@ -6,8 +6,6 @@ import { adjustStructuredDiffContext, buildStructuredDiff, type StructuredDiff, 
 import {
   clampSelectedLineTarget,
   createInitialReviewState,
-  cycleFocus,
-  cycleFocusBackward,
   deleteComment,
   ensureActiveFile,
   getCommentsForFileScope,
@@ -91,23 +89,54 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function cmdQuote(value: string): string {
+  return `"${value.replace(/"/g, `""`)}"`;
+}
+
+function safeLineNumber(line: number): number {
+  return Math.max(1, Math.floor(line));
+}
+
+export function buildDefaultAppLaunchCommand(platform: NodeJS.Platform, filePath: string, line: number): string {
+  const lineNumber = safeLineNumber(line);
+  if (platform === "darwin") return `open ${shellQuote(filePath)} --args +${lineNumber}`;
+  if (platform === "win32") return `cmd /c start "" ${cmdQuote(filePath)}`;
+  return `xdg-open ${shellQuote(filePath)}`;
+}
+
 export function buildEditorLaunchCommand(editorCommand: string, filePath: string, line: number): string {
-  const lineNumber = Math.max(1, Math.floor(line));
+  const lineNumber = safeLineNumber(line);
   return `${editorCommand.trim() || "vi"} +${lineNumber} -- ${shellQuote(filePath)}`;
 }
 
-function runShellCommand(command: string, cwd: string): Promise<number | null> {
+function runShellCommand(command: string, cwd: string, stdio: "inherit" | "ignore" = "inherit"): Promise<number | null> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, {
       cwd,
       env: process.env,
       shell: true,
-      stdio: "inherit",
+      stdio,
     });
 
     child.once("error", reject);
     child.once("close", (code) => resolve(code));
   });
+}
+
+export function getNextVisibleFocus(current: ReviewState["focus"], commentsHidden: boolean, backward = false): ReviewState["focus"] {
+  const visible: ReviewState["focus"][] = commentsHidden ? ["navigator", "diff"] : ["navigator", "diff", "comments"];
+  const currentIndex = visible.indexOf(current);
+  const index = currentIndex >= 0 ? currentIndex : 0;
+  const direction = backward ? -1 : 1;
+  return visible[(index + direction + visible.length) % visible.length]!;
+}
+
+export function getDraftCommentCount(state: Pick<ReviewState, "draft">): number {
+  return state.draft.comments.length + (state.draft.allComment.trim().length > 0 ? 1 : 0);
+}
+
+export function getCancelAction(state: ReviewState): "cancel" | "confirm-discard" {
+  return hasDraftContent(state) ? "confirm-discard" : "cancel";
 }
 
 export function getEditorLineForTarget(diff: StructuredDiff, target: ReviewLineTarget): number {
@@ -493,6 +522,7 @@ class ReviewApp {
   private shortcutMode = false;
   private helpMode = false;
   private commentsHidden = false;
+  private discardConfirmOpen = false;
   private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
   private editor: Editor;
@@ -913,43 +943,75 @@ class ReviewApp {
     this.editLineComment();
   }
 
-  private async openSelectedLineInEditor(): Promise<void> {
-    if (this.externalEditorOpen) return;
-
+  private getSelectedLineOpenLocation(openerLabel: string): { file: ReviewFile; filePath: string; editorLine: number } | null {
     const file = this.activeFile();
     if (file == null) {
       this.setMessage("No file selected.");
       this.requestRender();
-      return;
+      return null;
     }
 
     if (!file.hasWorkingTreeFile) {
-      this.setMessage("Cannot open this file in $EDITOR because it does not exist in the working tree.");
+      this.setMessage(`Cannot open this file in ${openerLabel} because it does not exist in the working tree.`);
       this.requestRender();
-      return;
+      return null;
     }
 
     const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
     if (target == null) {
-      this.setMessage("No selectable diff line to open in $EDITOR.");
+      this.setMessage(`No selectable diff line to open in ${openerLabel}.`);
       this.requestRender();
-      return;
+      return null;
     }
 
     const diff = this.getDisplayDiff(file.id, this.state.activeScope);
     if (diff == null) {
       this.setMessage("Diff is still loading; try again in a moment.");
       this.requestRender();
-      return;
+      return null;
     }
 
-    const editorLine = getEditorLineForTarget(diff, target);
+    return {
+      file,
+      filePath: join(this.options.repoRoot, file.path),
+      editorLine: getEditorLineForTarget(diff, target),
+    };
+  }
+
+  private async openSelectedLineInDefaultApp(): Promise<void> {
+    if (this.externalEditorOpen) return;
+
+    const location = this.getSelectedLineOpenLocation("the default app");
+    if (location == null) return;
+
+    const command = buildDefaultAppLaunchCommand(process.platform, location.filePath, location.editorLine);
+    this.externalEditorOpen = true;
+    this.setMessage(`Opening ${location.file.path}:${location.editorLine} in the default app…`);
+    this.requestRender();
+
+    try {
+      const code = await runShellCommand(command, this.options.repoRoot, "ignore");
+      this.setMessage(code === 0 ? `Opened ${location.file.path}:${location.editorLine} in the default app.` : `Default app opener exited with code ${code ?? "unknown"}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.setMessage(`Could not open the default app: ${message}`);
+    } finally {
+      this.externalEditorOpen = false;
+      this.requestRender();
+    }
+  }
+
+  private async openSelectedLineInEditor(): Promise<void> {
+    if (this.externalEditorOpen) return;
+
+    const location = this.getSelectedLineOpenLocation("$EDITOR");
+    if (location == null) return;
+
     const editorCommand = (process.env.EDITOR || process.env.VISUAL || "vi").trim() || "vi";
-    const filePath = join(this.options.repoRoot, file.path);
-    const command = buildEditorLaunchCommand(editorCommand, filePath, editorLine);
+    const command = buildEditorLaunchCommand(editorCommand, location.filePath, location.editorLine);
 
     this.externalEditorOpen = true;
-    this.setMessage(`Opening ${file.path}:${editorLine} in $EDITOR…`);
+    this.setMessage(`Opening ${location.file.path}:${location.editorLine} in $EDITOR…`);
     this.requestRender();
 
     try {
@@ -957,7 +1019,7 @@ class ReviewApp {
       if (typeof this.tui.stop === "function") this.tui.stop();
       if (typeof this.tui.terminal?.clearScreen === "function") this.tui.terminal.clearScreen();
       const code = await runShellCommand(command, this.options.repoRoot);
-      this.setMessage(code === 0 ? `Returned from $EDITOR at ${file.path}:${editorLine}.` : `$EDITOR exited with code ${code ?? "unknown"}.`);
+      this.setMessage(code === 0 ? `Returned from $EDITOR at ${location.file.path}:${location.editorLine}.` : `$EDITOR exited with code ${code ?? "unknown"}.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.setMessage(`Could not open $EDITOR: ${message}`);
@@ -975,11 +1037,43 @@ class ReviewApp {
       this.requestRender();
       return;
     }
+    this.discardConfirmOpen = false;
     this.done({ type: "submit", ...this.state.draft });
   }
 
   private cancel(): void {
+    this.discardConfirmOpen = false;
     this.done({ type: "cancel" });
+  }
+
+  private requestCancel(): void {
+    if (getCancelAction(this.state) === "cancel") {
+      this.cancel();
+      return;
+    }
+    this.discardConfirmOpen = true;
+    const count = getDraftCommentCount(this.state);
+    const noun = count === 1 ? "comment" : "comments";
+    this.setMessage(`Discard ${count} ${noun}? Press y to discard, n/Esc to keep reviewing.`);
+    this.requestRender();
+  }
+
+  private closeDiscardConfirmation(): void {
+    this.discardConfirmOpen = false;
+    this.setMessage("Kept comments. Continue reviewing.");
+    this.requestRender();
+  }
+
+  private handleDiscardConfirmationInput(data: string): void {
+    if (data === "y" || data === "Y") {
+      this.cancel();
+      return;
+    }
+    if (data === "n" || data === "N" || matchesKey(data, Key.escape)) {
+      this.closeDiscardConfirmation();
+      return;
+    }
+    this.requestRender();
   }
 
   private moveHunk(delta: number): void {
@@ -1058,13 +1152,7 @@ class ReviewApp {
   }
 
   private cycleVisibleFocus(backward = false): void {
-    if (!this.commentsHidden) {
-      this.state = backward ? cycleFocusBackward(this.state) : cycleFocus(this.state);
-      this.requestRender();
-      return;
-    }
-
-    const nextFocus = this.state.focus === "navigator" ? "diff" : "navigator";
+    const nextFocus = getNextVisibleFocus(this.state.focus, this.commentsHidden, backward);
     this.state = setFocus(this.state, nextFocus);
     this.requestRender();
   }
@@ -1210,6 +1298,10 @@ class ReviewApp {
 
   handleInput(data: string): void {
     if (this.externalEditorOpen) return;
+    if (this.discardConfirmOpen) {
+      this.handleDiscardConfirmationInput(data);
+      return;
+    }
     if (this.handleMouseWheel(data)) return;
 
     if (this.editTarget != null) {
@@ -1258,9 +1350,9 @@ class ReviewApp {
     if (data === "1") { this.setScope("git-diff"); return; }
     if (data === "2") { this.setScope("last-commit"); return; }
     if (data === "3") { this.setScope("all-files"); return; }
-    if (matchesKey(data, Key.shift("tab"))) { this.cycleVisibleFocus(true); return; }
-    if (matchesKey(data, Key.tab)) { this.cycleVisibleFocus(); return; }
-    if (matchesKey(data, Key.escape)) { this.cancel(); return; }
+    if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) { this.cycleVisibleFocus(true); return; }
+    if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) { this.cycleVisibleFocus(); return; }
+    if (matchesKey(data, Key.escape)) { this.requestCancel(); return; }
     if (data === "h") { this.toggleCommentsPane(); return; }
     if (data === "w") { this.state = setWrapLines(this.state, !this.state.wrapLines); this.requestRender(); return; }
     if (data === "u") { this.state = toggleHideUnchanged(this.state); this.ensureLineSelection(); this.requestRender(); return; }
@@ -1322,7 +1414,7 @@ class ReviewApp {
           return;
         }
         if (data === "o") {
-          void this.openSelectedLineInEditor();
+          void this.openSelectedLineInDefaultApp();
           return;
         }
         if (data === "f") {
@@ -1334,7 +1426,7 @@ class ReviewApp {
           return;
         }
         if (data === "e") {
-          this.editCurrentLineComment();
+          void this.openSelectedLineInEditor();
           return;
         }
         if (data === "x") {
@@ -1508,9 +1600,9 @@ class ReviewApp {
     lines.push(this.theme.fg("muted", "? toggle help • Esc close"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Keys"));
-    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • r related • h comments • s submit"));
-    lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • e edit line • x delete line"));
-    lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o open in $EDITOR • l file • a all • n/p hunks"));
+    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab/←/→ focus • / shortcuts/search • r related • h comments • s submit"));
+    lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • x delete line"));
+    lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o default app • e $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Editor"));
     lines.push(this.theme.fg("muted", "Tab toggle • Enter save • Shift+Enter newline • Esc cancel"));
@@ -1529,6 +1621,29 @@ class ReviewApp {
     lines.push(...wrapAnsiText(this.theme.fg("muted", getShortcutConfigPath()), Math.max(10, width - 4), true));
 
     return renderBox("Help", width, height, this.theme, lines, true);
+  }
+
+  private renderDiscardConfirmation(width: number, height: number): string[] {
+    const count = getDraftCommentCount(this.state);
+    const noun = count === 1 ? "comment" : "comments";
+    const dialogWidth = Math.max(24, Math.min(width, 62));
+    const dialogHeight = Math.max(5, Math.min(height, 8));
+    const lines = [
+      this.theme.fg("warning", `Discard ${count} ${noun}?`),
+      this.theme.fg("muted", "This will close /slopchop and lose your review notes."),
+      "",
+      `${this.theme.fg("error", "y")} discard  ${this.theme.fg("success", "n")} keep reviewing  ${this.theme.fg("muted", "Esc keep reviewing")}`,
+    ];
+    const dialog = renderBox("Confirm discard", dialogWidth, dialogHeight, this.theme, lines, true);
+    const topPadding = Math.max(0, Math.floor((height - dialog.length) / 2));
+    const leftPadding = Math.max(0, Math.floor((width - dialogWidth) / 2));
+    const body: string[] = [];
+
+    for (let i = 0; i < topPadding; i += 1) body.push("");
+    for (const line of dialog) body.push(`${" ".repeat(leftPadding)}${line}`);
+    while (body.length < height) body.push("");
+
+    return body.slice(0, height);
   }
 
   private renderComments(width: number, height: number): string[] {
@@ -1656,15 +1771,18 @@ class ReviewApp {
     const contentLeft = overlayOriginCol + 1 + MODAL_INNER_PADDING_X;
 
     const layoutStatus = stackPanes ? "stacked layout • " : "";
-    const promptStatus = this.shortcutMode
-      ? "Shortcut mode • choose from the comments panel • Esc cancel"
-      : this.helpMode
-        ? "Help open • ? toggle • Esc close"
-        : this.message ?? (this.searchMode
-          ? `Search: ${this.searchBuffer}`
-          : this.editTarget != null
-            ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${layoutStatus}Tab focus • / search • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open • s submit • Esc cancel`);
+    const discardCount = getDraftCommentCount(this.state);
+    const promptStatus = this.discardConfirmOpen
+      ? `Discard ${discardCount} comment${discardCount === 1 ? "" : "s"}? y discard • n/Esc keep reviewing`
+      : this.shortcutMode
+        ? "Shortcut mode • choose from the comments panel • Esc cancel"
+        : this.helpMode
+          ? "Help open • ? toggle • Esc close"
+          : this.message ?? (this.searchMode
+            ? `Search: ${this.searchBuffer}`
+            : this.editTarget != null
+              ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
+              : `${layoutStatus}Tab/←/→ focus • / search • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o default app • e $EDITOR • s submit • Esc cancel`);
 
     const scopeTabs = SEARCHABLE_SCOPES.map((scope, index) => {
       const active = this.state.activeScope === scope;
@@ -1679,7 +1797,14 @@ class ReviewApp {
 
     const body: string[] = [];
 
-    if (stackPanes) {
+    if (this.discardConfirmOpen) {
+      this.mousePaneLayout = {
+        navigator: { top: bodyTop, bottom: bodyTop + bodyHeight - 1, left: contentLeft, right: contentLeft + frameInnerWidth - 1 },
+        diff: { top: bodyTop, bottom: bodyTop + bodyHeight - 1, left: contentLeft, right: contentLeft + frameInnerWidth - 1 },
+        comments: null,
+      };
+      body.push(...this.renderDiscardConfirmation(frameInnerWidth, bodyHeight));
+    } else if (stackPanes) {
       const { navigatorHeight, diffHeight, commentsHeight } = getStackedPaneLayout(bodyHeight, this.commentsHidden);
       const paneLeft = contentLeft;
       const paneRight = contentLeft + frameInnerWidth - 1;
@@ -1718,7 +1843,7 @@ class ReviewApp {
 
     const footer = [
       truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: h hide/show, ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • focus: Tab/Shift+Tab/←/→ • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o default app, e $EDITOR, f fix line, d/c discuss line, x delete, l file, a all, n/p hunks • comments: h hide/show, ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
     ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);

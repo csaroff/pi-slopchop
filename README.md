@@ -36,7 +36,7 @@ Inside the review UI you can:
 ### Install
 
 ```bash
-pi install npm:pi-slopchop
+pi install https://github.com/csaroff/pi-slopchop
 ```
 
 Then restart Pi or run `/reload`.
@@ -162,14 +162,15 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 
 - `1 / 2 / 3` — switch scope
 - mouse wheel — scroll the pane under the cursor
-- `Tab` — cycle focus: navigator → diff → comments
+- `Tab` / `→` — cycle focus: navigator → diff → comments
+- `Shift+Tab` / `←` — cycle focus backward
 - `/` — search files, or open slash shortcuts in diff focus
 - `?` — toggle help in the right sidebar
 - `w` — toggle wrapping
 - `u` — toggle unchanged context in diff scopes
 - `h` — hide/show the comments pane
 - `s` — insert the generated prompt into the editor
-- `Esc` — cancel the review
+- `Esc` — cancel the review; asks before discarding saved comments
 
 #### Navigator
 
@@ -184,10 +185,10 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 - `↑↓` or `j/k` — move between selectable added/deleted lines
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `n / p` — next / previous hunk
-- `o` — open the selected line in `$EDITOR`, then return to `/slopchop` when the editor exits
+- `o` — open the selected line in the system default application
 - `f` — line comment, default `FIX`
 - `d` or `c` — line comment, default `DISCUSS`
-- `e` — edit the existing line comment on the selected line
+- `e` — open the selected line in `$EDITOR`, then return to `/slopchop` when the editor exits
 - `x` — delete the existing line comment on the selected line
 - `l` — file comment
 - `a` — whole-change note
@@ -231,7 +232,7 @@ This is designed for repetitive review patterns like:
 - simplify this
 - add tests
 
-If you want to refine the templated text after applying it, press `e` on that line.
+If you want to refine the templated text after applying it, select it in the comments panel and press `e` or `Enter`.
 
 ### Shortcut configuration
 
