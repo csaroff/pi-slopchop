@@ -1,8 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getReviewWindowData, loadReviewFileContents } from "./git.js";
-import { composeReviewPrompt } from "./prompt.js";
-import { loadCommentShortcuts } from "./shortcuts.js";
-import { runReviewApp } from "./ui/review-app.js";
 
 export default function slopReviewExtension(pi: ExtensionAPI) {
   let activeReview = false;
@@ -15,6 +11,17 @@ export default function slopReviewExtension(pi: ExtensionAPI) {
 
     activeReview = true;
     try {
+      const [
+        { getReviewWindowData, loadReviewFileContents },
+        { composeReviewPrompt },
+        { loadCommentShortcuts },
+        { runReviewApp },
+      ] = await Promise.all([
+        import("./git.js"),
+        import("./prompt.js"),
+        import("./shortcuts.js"),
+        import("./ui/review-app.js"),
+      ]);
       const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
       const shortcutConfig = loadCommentShortcuts();
       if (files.length === 0) {
